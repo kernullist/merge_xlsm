@@ -3,12 +3,41 @@ import os
 import win32com.client
 
 
+XL_CALCULATION_AUTOMATIC = -4105
+XL_CALCULATION_MANUAL = -4135
+VBA_COMPONENT_EXTENSIONS = {
+    1: ".bas",
+    2: ".cls",
+    3: ".frm",
+}
+
+
+def normalize_2d(values):
+    if values is None:
+        return []
+    if not isinstance(values, tuple):
+        return [[values]]
+
+    if not values:
+        return []
+
+    first = values[0]
+    if isinstance(first, tuple):
+        return [list(row) for row in values]
+
+    return [list(values)]
+
+
 def find_header_row(ws):
     last_row = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
-    for r in range(1, last_row + 1):
-        val = ws.Cells(r, 2).Value
+    if last_row < 1:
+        return None
+
+    col_values = normalize_2d(ws.Range(ws.Cells(1, 2), ws.Cells(last_row, 2)).Value)
+    for idx, row in enumerate(col_values, start=1):
+        val = row[0] if row else None
         if val is not None and str(val).strip() == "Id":
-            return r
+            return idx
     return None
 
 
@@ -20,14 +49,15 @@ def get_used_columns(ws):
 def read_data_rows(ws, header_row, num_cols):
     data_start = header_row + 1
     last_row = ws.UsedRange.Row + ws.UsedRange.Rows.Count - 1
+    if data_start > last_row:
+        return []
+
+    values = normalize_2d(ws.Range(ws.Cells(data_start, 1), ws.Cells(last_row, num_cols)).Value)
     rows = []
-    for r in range(data_start, last_row + 1):
-        key = ws.Cells(r, 2).Value
+    for row_data in values:
+        key = row_data[1] if len(row_data) > 1 else None
         if key is None or str(key).strip() == "":
             break
-        row_data = []
-        for c in range(1, num_cols + 1):
-            row_data.append(ws.Cells(r, c).Value)
         rows.append((str(key).strip(), row_data))
     return rows
 
@@ -102,18 +132,26 @@ def merge_sheet_data(ws1, ws2, sheet_name):
     data_start = header1 + 1
     old_last_row = ws1.UsedRange.Row + ws1.UsedRange.Rows.Count - 1
 
-    clear_end = max(data_start + len(merged_rows), old_last_row)
-    for r in range(data_start, clear_end + 1):
-        for c in range(1, num_cols + 1):
-            ws1.Cells(r, c).ClearContents()
+    clear_end = max(data_start + len(merged_rows) - 1, old_last_row)
+    if clear_end >= data_start:
+        ws1.Range(ws1.Cells(data_start, 1), ws1.Cells(clear_end, num_cols)).ClearContents()
 
-    for r_idx, row_data in enumerate(merged_rows):
-        for c_idx, val in enumerate(row_data):
-            if val is not None:
-                ws1.Cells(data_start + r_idx, c_idx + 1).Value = val
+    if merged_rows:
+        write_values = tuple(tuple(row) for row in merged_rows)
+        ws1.Range(
+            ws1.Cells(data_start, 1),
+            ws1.Cells(data_start + len(merged_rows) - 1, num_cols),
+        ).Value = write_values
 
     print(f"  Merged '{sheet_name}': {len(main_rows)} main + {len(hotfix_rows)} hotfix -> {len(merged_rows)} rows")
     return True
+
+
+def get_vba_component(vb_project, component_name):
+    try:
+        return vb_project.VBComponents(component_name)
+    except Exception:
+        return None
 
 
 def merge_xlsm(file1, file2, output_file):
@@ -136,16 +174,40 @@ def merge_xlsm(file1, file2, output_file):
 
     excel.Visible = False
     excel.DisplayAlerts = False
+    excel.ScreenUpdating = False
+    excel.EnableEvents = False
+    excel.AskToUpdateLinks = False
 
     wb1 = None
     wb2 = None
+    previous_calculation = None
+    calculation_switched = False
 
     try:
         print(f"Opening '{os.path.basename(file1)}'...")
-        wb1 = excel.Workbooks.Open(file1)
+        wb1 = excel.Workbooks.Open(
+            file1,
+            UpdateLinks=0,
+            ReadOnly=False,
+            IgnoreReadOnlyRecommended=True,
+            AddToMru=False,
+        )
 
         print(f"Opening '{os.path.basename(file2)}'...")
-        wb2 = excel.Workbooks.Open(file2)
+        wb2 = excel.Workbooks.Open(
+            file2,
+            UpdateLinks=0,
+            ReadOnly=True,
+            IgnoreReadOnlyRecommended=True,
+            AddToMru=False,
+        )
+
+        try:
+            previous_calculation = excel.Calculation
+            excel.Calculation = XL_CALCULATION_MANUAL
+            calculation_switched = True
+        except Exception as calc_e:
+            print(f"WARNING: Could not switch Excel to manual calculation mode: {calc_e}")
 
         wb1_sheet_names = set()
         for i in range(1, wb1.Sheets.Count + 1):
@@ -167,33 +229,37 @@ def merge_xlsm(file1, file2, output_file):
 
         print("Attempting to merge VBA modules...")
         try:
-            temp_dir = os.environ.get('TEMP', 'C:\\Temp')
+            temp_dir = os.environ.get("TEMP", "C:\\Temp")
             for comp in wb2.VBProject.VBComponents:
-                if comp.Type in [1, 2, 3]:
-                    if comp.Type == 1:
-                        ext = ".bas"
-                    elif comp.Type == 2:
-                        ext = ".cls"
-                    else:
-                        ext = ".frm"
-
+                ext = VBA_COMPONENT_EXTENSIONS.get(comp.Type)
+                if ext:
                     temp_path = os.path.join(temp_dir, comp.Name + ext)
+                    frx_path = os.path.join(temp_dir, comp.Name + ".frx")
                     print(f"  Exporting VBA module: {comp.Name}")
                     comp.Export(temp_path)
 
-                    wb1.VBProject.VBComponents.Import(temp_path)
-                    os.remove(temp_path)
+                    existing_comp = get_vba_component(wb1.VBProject, comp.Name)
+                    if existing_comp is not None and existing_comp.Type in VBA_COMPONENT_EXTENSIONS:
+                        print(f"  Replacing existing VBA module: {comp.Name}")
+                        wb1.VBProject.VBComponents.Remove(existing_comp)
 
-                    if comp.Type == 3:
-                        frx_path = os.path.join(temp_dir, comp.Name + ".frx")
-                        if os.path.exists(frx_path):
-                            os.remove(frx_path)
+                    wb1.VBProject.VBComponents.Import(temp_path)
+
+                    if os.path.exists(temp_path):
+                        os.remove(temp_path)
+                    if comp.Type == 3 and os.path.exists(frx_path):
+                        os.remove(frx_path)
 
         except Exception as vba_e:
             print("\nWARNING: Could not merge VBA modules.")
             print("To allow VBA merging, go to Excel -> Options -> Trust Center -> Trust Center Settings -> Macro Settings")
             print("And check 'Trust access to the VBA project object model'.")
             print(f"Error details: {vba_e}\n")
+
+        if calculation_switched:
+            print("Recalculating workbook...")
+            excel.Calculation = XL_CALCULATION_AUTOMATIC
+            excel.CalculateFullRebuild()
 
         print(f"Saving merged workbook as '{os.path.basename(output_file)}'...")
         wb1.SaveAs(output_file, FileFormat=52)
@@ -202,6 +268,11 @@ def merge_xlsm(file1, file2, output_file):
     except Exception as e:
         print(f"Error during merge operation: {e}")
     finally:
+        if calculation_switched and previous_calculation is not None:
+            try:
+                excel.Calculation = previous_calculation
+            except Exception:
+                pass
         if wb2:
             wb2.Close(False)
         if wb1:
